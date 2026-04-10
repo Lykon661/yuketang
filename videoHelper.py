@@ -36,20 +36,20 @@ exam_helper_enabled = True
 exam_fetch_debug_enabled = False
 exam_ai_helper_enabled = True
 exam_auto_submit_enabled = True
-exam_system_base_url = "https://changjiang-exam.yuketang.cn/"
+exam_system_base_url = ""#(需要改成考试系统的域名，例如https://*****.yuketang.cn/exam_system/)
 exam_system_access_token = ""  # 可填写纯 token，或整段 cookie 中的 x_access_token=...
 
 # AI study helper config
 study_helper_enabled = True
 study_helper_debug_enabled = False
-study_helper_api_url = "https://api.minimaxi.com/v1/text/chatcompletion_v2"
+study_helper_api_url = ""
 study_helper_api_key = ""  # 需改成自己的
-study_helper_model = "MiniMax-M2.7"
+study_helper_model = ""
 study_helper_temperature = 0.2
 
 # search helper config
 search_helper_enabled = False
-search_helper_api_url = "https://api.tavily.com/search"
+search_helper_api_url = ""#(建议使用https://api.tavily.com/search)
 search_helper_api_key = ""  # 需改成自己的
 search_helper_max_results = 5
 

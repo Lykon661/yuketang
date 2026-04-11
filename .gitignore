@@ -142,3 +142,15 @@ env1/
 !.env.example
 *.local.py
 videoHelper.local.py
+
+# Playwright
+playwright-report/
+test-results/
+.playwright/
+
+# Local logs and dumps
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej

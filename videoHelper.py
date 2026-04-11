@@ -7,11 +7,18 @@ import requests
 import re
 import json
 import base64
+from urllib.parse import urlparse
 
 try:
     import tkinter as tk
 except Exception:
     tk = None
+
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+except Exception:
+    sync_playwright = None
+    PlaywrightTimeoutError = Exception
 
 # 以下的csrftoken和sessionid需要改成自己登录后的cookie中对应的字段！！！！而且脚本需在登录雨课堂状态下使用
 # 登录上雨课堂，然后按F12-->选Application-->找到雨课堂的cookies，寻找csrftoken、sessionid、university_id字段，并复制到下面两行即可
@@ -20,12 +27,12 @@ sessionid = ""  # 需改成自己的
 university_id = ""  # 需改成自己的
 url_root = ""  # 按需修改域名 example:https://*****.yuketang.cn/
 learning_rate = 4  # 学习速率 我觉得默认的这个就挺好的
-video_auto_watch_enabled = False
+video_auto_watch_enabled = True
 request_timeout = 15
 
 # discussion helper config
-discussion_helper_enabled = False
-discussion_send_enabled = False
+discussion_helper_enabled = True
+discussion_send_enabled = True
 discussion_debug_enabled = False
 discussion_fetch_path = "v/discussion/v2/unit/discussion/?date={date}&term=latest&classroom_id={classroom_id}&sku_id={sku_id}&leaf_id={discussion_id}&topic_type=4&channel=xt"
 discussion_comment_list_path = "v/discussion/v2/comment/list/{topic_id}/?_date={date}&term=latest&offset=0&limit=10&web=web"
@@ -36,8 +43,12 @@ exam_helper_enabled = True
 exam_fetch_debug_enabled = False
 exam_ai_helper_enabled = True
 exam_auto_submit_enabled = True
-exam_system_base_url = ""#(需要改成考试系统的域名，例如https://*****.yuketang.cn/exam_system/)
-exam_system_access_token = ""  # 可填写纯 token，或整段 cookie 中的 x_access_token=...
+exam_browser_auto_context_enabled = True
+exam_browser_headless = False
+exam_browser_timeout_ms = 15000
+exam_browser_action_timeout_ms = 5000
+exam_browser_max_click_rounds = 4
+exam_browser_debug_enabled = False
 
 # AI study helper config
 study_helper_enabled = True
@@ -48,7 +59,7 @@ study_helper_model = ""
 study_helper_temperature = 0.2
 
 # search helper config
-search_helper_enabled = False
+search_helper_enabled = True
 search_helper_api_url = ""#(建议使用https://api.tavily.com/search)
 search_helper_api_key = ""  # 需改成自己的
 search_helper_max_results = 5
@@ -97,18 +108,42 @@ def copy_to_clipboard(text):
 def build_study_helper_headers():
     return {
         "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Connection": "close",
         "Authorization": "Bearer " + study_helper_api_key
     }
 
 
+def build_study_helper_request_url():
+    api_url = str(study_helper_api_url).strip()
+    if not api_url:
+        raise Exception("study_helper_api_url 为空，请先在脚本顶部填入 AI 接口地址")
+
+    normalized_url = api_url.rstrip("/")
+    lower_url = normalized_url.lower()
+    if lower_url.endswith("/v1/text/chatcompletion_v2"):
+        return normalized_url
+    if lower_url.endswith("/v1"):
+        return normalized_url + "/text/chatcompletion_v2"
+    return normalized_url
+
+
 def is_search_worthy_question(question_text):
-    text = str(question_text)
+    text = normalize_text(strip_html_tags(question_text))
     keywords = (
         "最新", "近日", "今年", "本月", "本周", "目前", "截至", "近期",
-        "2024", "2025", "2026", "时政", "政策", "会议", "通知", "发布",
-        "印发", "提出", "科技成就", "中央一号文件", "工作报告"
+        "2024", "2025", "2026", "2027", "时政", "政策", "会议", "通知", "发布",
+        "印发", "提出", "科技成就", "中央一号文件", "工作报告", "政府工作报告",
+        "总书记", "国务院", "党中央", "两会", "航天", "科技", "文件", "意见",
+        "方案", "行动", "首次", "成功", "完成", "启动", "举行", "召开"
     )
-    return any(keyword in text for keyword in keywords)
+    if any(keyword in text for keyword in keywords):
+        return True
+    if re.search(r"\b20\d{2}\b", text):
+        return True
+    if re.search(r"(?:\d{4}年\d{1,2}月|\d{1,2}月\d{1,2}日)", text):
+        return True
+    return False
 
 
 def build_search_helper_headers():
@@ -121,8 +156,55 @@ def extract_search_query(question_text):
     text = normalize_text(strip_html_tags(question_text))
     text = re.sub(r"第\d+题", " ", text)
     text = re.sub(r"题型：\S+", " ", text)
+    text = re.sub(r"题干：", " ", text)
     text = re.sub(r"选项：.*", " ", text)
-    return text[:240].strip()
+    text = re.sub(r"[A-H][\.、:].*?(?=(?:[A-H][\.、:]|$))", " ", text)
+    text = re.sub(r"\(\s*\)", " ", text)
+    text = re.sub(r"[“”\"'【】（）()、，,。；;：:!?？]+", " ", text)
+    text = normalize_text(text)
+
+    quoted_phrases = re.findall(r"(《[^》]{2,40}》|“[^”]{2,40}”|\"[^\"]{2,40}\")", strip_html_tags(question_text))
+    date_phrases = re.findall(r"(20\d{2}年\d{1,2}月\d{1,2}日|20\d{2}年\d{1,2}月|20\d{2}年|\d{1,2}月\d{1,2}日)", text)
+    keyword_phrases = re.findall(
+        r"([^\s]{2,30}(?:会议|意见|通知|文件|方案|规划|报告|成就|行动|行动计划|工程|飞行|发射|启动|试验|试飞|政策))",
+        text
+    )
+
+    stop_words = {
+        "第1题", "第2题", "第3题", "第4题", "题型", "题干", "单选题", "多选题", "判断题",
+        "下列", "以下", "关于", "说法", "正确", "错误", "包括", "的是", "属于", "不属于",
+        "根据", "材料", "内容", "哪项", "哪一项", "表述", "问题"
+    }
+    tokens = []
+    for token in text.split(" "):
+        token = token.strip()
+        if not token or token in stop_words:
+            continue
+        if len(token) == 1 and not re.search(r"\d", token):
+            continue
+        tokens.append(token)
+
+    prioritized_parts = []
+    prioritized_parts.extend(quoted_phrases[:2])
+    prioritized_parts.extend(date_phrases[:2])
+    prioritized_parts.extend(keyword_phrases[:4])
+    prioritized_parts.extend(tokens[:10])
+
+    deduped_parts = []
+    for part in prioritized_parts:
+        cleaned = normalize_text(part).strip("\"'")
+        if not cleaned or cleaned in deduped_parts:
+            continue
+        deduped_parts.append(cleaned)
+
+    query = " ".join(deduped_parts[:8]).strip()
+    if not query:
+        query = text[:120].strip()
+    if re.search(r"\b20\d{2}\b", query) is None:
+        matched_year = re.search(r"\b20\d{2}\b", text)
+        if matched_year:
+            query = matched_year.group(0) + " " + query
+    return query[:140].strip()
 
 
 def search_latest_context(question_text):
@@ -146,7 +228,7 @@ def search_latest_context(question_text):
         url=search_helper_api_url,
         headers=build_search_helper_headers(),
         json=payload,
-        timeout=request_timeout
+        timeout=max(request_timeout, 30)
     )
     if not (200 <= response.status_code < 300):
         raise Exception("搜索请求失败: " + str(response.status_code) + " " + (response.text[:300] if response.text else ""))
@@ -180,7 +262,7 @@ def build_study_helper_messages(question_text, search_context=""):
     system_prompt = (
         "你是一个谨慎的学习辅导助手。"
         "请根据用户给出的题目文本做简短分析，优先输出可直接作答的结果。"
-        "如果提供了外部检索资料，优先依据资料回答。"
+        "如果提供了外部检索资料，必须优先依据资料回答，不要再用知识截止时间作为借口。"
         "如果题目信息不完整或资料不足，要明确指出不确定性，不要编造。"
     )
     user_prompt = (
@@ -195,6 +277,7 @@ def build_study_helper_messages(question_text, search_context=""):
         "3. 判断题输出 对 或 错。\n"
         "4. 填空、简答、计算类题目，输出你认为最可能的简短答案；如果无法可靠判断，明确写 不确定。\n"
         "5. 不要在 建议答案 一行里添加多余解释。\n\n"
+        "6. 如果已经提供外部检索资料，请基于检索资料作答，不要回答“我不了解 2026 年之后的信息”之类的话。\n\n"
         + ("可参考的最新检索资料：\n" + search_context + "\n\n" if search_context else "")
         + "题目内容：\n"
         + question_text
@@ -209,19 +292,23 @@ def call_study_helper_ai(question_text, search_context=""):
     if not study_helper_api_key.strip():
         raise Exception("study_helper_api_key 为空，请先在脚本顶部填入自己的 API Key")
 
+    request_url = build_study_helper_request_url()
     payload = {
         "model": study_helper_model,
         "messages": build_study_helper_messages(question_text, search_context),
         "temperature": study_helper_temperature
     }
-    response = requests.post(
-        url=study_helper_api_url,
-        headers=build_study_helper_headers(),
-        json=payload,
-        timeout=request_timeout
-    )
+    try:
+        response = requests.post(
+            url=request_url,
+            headers=build_study_helper_headers(),
+            json=payload,
+            timeout=max(request_timeout, 30)
+        )
+    except requests.RequestException as e:
+        raise Exception("AI 网络请求失败: " + str(e) + "；当前请求地址为 " + request_url)
     if study_helper_debug_enabled:
-        print("study helper status: " + str(response.status_code) + " -> " + study_helper_api_url)
+        print("study helper status: " + str(response.status_code) + " -> " + request_url)
 
     if not (200 <= response.status_code < 300):
         raise Exception("AI 请求失败: " + str(response.status_code) + " " + (response.text[:300] if response.text else ""))
@@ -384,11 +471,16 @@ def analyze_question_text(question_text, title=None):
     ensure_study_helper_ready()
     search_context = ""
     if search_helper_enabled and is_search_worthy_question(question_text):
+        query_text = extract_search_query(question_text)
         print("检测到时效性题目，正在搜索最新资料...")
+        if study_helper_debug_enabled:
+            print("search query: " + query_text)
         try:
             search_context = search_latest_context(question_text)
             if search_context:
                 print("已获取最新检索资料。")
+                if study_helper_debug_enabled:
+                    print("search context preview: " + search_context[:300])
             else:
                 print("未获取到可用检索资料，改用模型直接分析。")
         except Exception as e:
@@ -454,8 +546,8 @@ def build_discussion_comment_list_url(topic_id):
     )
 
 
-def extract_exam_system_access_token():
-    raw_value = str(exam_system_access_token).strip()
+def extract_exam_system_access_token_from_value(raw_value):
+    raw_value = str(raw_value).strip()
     if not raw_value:
         return ""
 
@@ -465,8 +557,8 @@ def extract_exam_system_access_token():
     return raw_value
 
 
-def decode_exam_token_payload():
-    access_token = extract_exam_system_access_token()
+def decode_exam_token_payload(access_token):
+    access_token = extract_exam_system_access_token_from_value(access_token)
     if not access_token:
         return {}
 
@@ -483,65 +575,565 @@ def decode_exam_token_payload():
         return {}
 
 
-def resolve_exam_id():
-    return decode_exam_token_payload().get("eid")
+def build_course_domain():
+    parsed = urlparse(url_root)
+    return parsed.netloc
+
+
+def build_course_scheme():
+    parsed = urlparse(url_root)
+    return parsed.scheme or "https"
+
+
+def build_course_browser_cookies():
+    course_domain = build_course_domain()
+    if not course_domain:
+        raise Exception("url_root 为空或格式不正确，无法注入课程登录 cookie")
+
+    cookies = []
+    for name, value in (
+        ("csrftoken", csrftoken),
+        ("sessionid", sessionid),
+        ("university_id", university_id),
+        ("platform_id", "3"),
+        ("platform_type", "1"),
+        ("xtbz", "cloud"),
+    ):
+        value = str(value).strip()
+        if not value:
+            continue
+        cookies.append({
+            "name": name,
+            "value": value,
+            "domain": course_domain,
+            "path": "/",
+            "httpOnly": False,
+            "secure": True,
+            "sameSite": "Lax"
+        })
+    return cookies
+
+
+def extract_exam_context_from_cookies(cookies):
+    for cookie in cookies:
+        if not isinstance(cookie, dict):
+            continue
+        name = cookie.get("name")
+        if name != "x_access_token":
+            continue
+        access_token = extract_exam_system_access_token_from_value(cookie.get("value", ""))
+        if not access_token:
+            continue
+        domain = str(cookie.get("domain", "")).lstrip(".")
+        if not domain:
+            continue
+        base_url = build_course_scheme() + "://" + domain
+        payload = decode_exam_token_payload(access_token)
+        exam_id = payload.get("eid")
+        if exam_id in (None, ""):
+            continue
+        return {
+            "exam_id": exam_id,
+            "access_token": access_token,
+            "base_url": base_url
+        }
+    return None
+
+
+def extract_exam_context_from_page_storage(page):
+    try:
+        storage_data = page.evaluate(
+            """() => ({
+                cookie: document.cookie || "",
+                local: Object.assign({}, window.localStorage || {}),
+                session: Object.assign({}, window.sessionStorage || {})
+            })"""
+        )
+    except Exception:
+        return None
+
+    candidate_values = [storage_data.get("cookie", "")]
+    for bucket_name in ("local", "session"):
+        bucket = storage_data.get(bucket_name, {})
+        if isinstance(bucket, dict):
+            candidate_values.extend(bucket.values())
+
+    for value in candidate_values:
+        access_token = extract_exam_system_access_token_from_value(value)
+        if not access_token or access_token == str(value).strip() and "." not in access_token:
+            continue
+        payload = decode_exam_token_payload(access_token)
+        exam_id = payload.get("eid")
+        if exam_id in (None, ""):
+            continue
+        parsed = urlparse(page.url)
+        base_url = (parsed.scheme or "https") + "://" + parsed.netloc if parsed.netloc else ""
+        if not base_url:
+            continue
+        return {
+            "exam_id": exam_id,
+            "access_token": access_token,
+            "base_url": base_url
+        }
+    return None
+
+
+def select_active_exam_page(context, current_page=None):
+    pages = list(context.pages)
+    exam_system_pages = []
+    course_exam_pages = []
+    for page in pages:
+        page_url = str(page.url or "")
+        if is_exam_system_page(page):
+            exam_system_pages.append(page)
+        elif "/exam/" in page_url or "yuketang.cn/exam" in page_url or "exam_room" in page_url:
+            course_exam_pages.append(page)
+    if exam_system_pages:
+        return exam_system_pages[-1]
+    if course_exam_pages:
+        return course_exam_pages[-1]
+    if pages:
+        return pages[-1]
+    return current_page
+
+
+def is_exam_system_page(page):
+    if not page:
+        return False
+    parsed = urlparse(str(page.url or ""))
+    current_domain = parsed.netloc.lower()
+    course_domain = build_course_domain().lower()
+    return bool(current_domain) and current_domain != course_domain
+
+
+def is_exam_start_page(page):
+    if not page:
+        return False
+    page_url = str(page.url or "")
+    return "/start/" in page_url
+
+
+def wait_for_exam_page_transition(context, current_page, previous_urls=None):
+    previous_urls = set(previous_urls or [])
+    for _ in range(12):
+        candidate_page = select_active_exam_page(context, current_page)
+        candidate_url = str(candidate_page.url or "") if candidate_page else ""
+        if candidate_page and (candidate_url not in previous_urls or is_exam_system_page(candidate_page)):
+            try:
+                candidate_page.wait_for_load_state("domcontentloaded", timeout=exam_browser_action_timeout_ms)
+            except Exception:
+                pass
+            return candidate_page
+        if current_page:
+            current_page.wait_for_timeout(300)
+    return select_active_exam_page(context, current_page)
+
+
+def click_first_exam_entry_and_wait_for_new_page(context, page):
+    previous_urls = [str(one_page.url or "") for one_page in context.pages]
+    clicked = None
+    new_page = None
+    try:
+        with context.expect_page(timeout=exam_browser_timeout_ms) as new_page_info:
+            clicked = try_click_exam_entry_button(page, on_exam_system_page=False)
+        new_page = new_page_info.value
+    except PlaywrightTimeoutError:
+        clicked = clicked or try_click_exam_entry_button(page, on_exam_system_page=False)
+    except Exception:
+        clicked = clicked or try_click_exam_entry_button(page, on_exam_system_page=False)
+
+    if not clicked:
+        return None, None
+
+    target_page = new_page or wait_for_exam_page_transition(context, page, previous_urls)
+    if target_page:
+        try:
+            target_page.wait_for_load_state("domcontentloaded", timeout=exam_browser_timeout_ms)
+        except Exception:
+            pass
+        try:
+            target_page.wait_for_load_state("networkidle", timeout=exam_browser_action_timeout_ms)
+        except Exception:
+            pass
+        target_page.wait_for_timeout(1200)
+    return clicked, target_page
+
+
+def extract_exam_context_from_browser(context, current_page=None):
+    exam_context = extract_exam_context_from_cookies(context.cookies())
+    if exam_context:
+        return exam_context
+
+    pages = list(context.pages)
+    if current_page and current_page not in pages:
+        pages.append(current_page)
+    for page in reversed(pages):
+        exam_context = extract_exam_context_from_page_storage(page)
+        if exam_context:
+            return exam_context
+    return None
+
+
+def log_exam_browser_state(context, page, click_history):
+    if not exam_browser_debug_enabled:
+        return
+    try:
+        print("browser pages:")
+        for index, one_page in enumerate(context.pages):
+            print("  [" + str(index) + "] " + str(one_page.url))
+        cookies = context.cookies()
+        cookie_names = [str(cookie.get("name", "")) for cookie in cookies if isinstance(cookie, dict)]
+        print("browser cookies: " + ", ".join(cookie_names))
+        if page:
+            print("active page: " + str(page.url))
+        if click_history:
+            print("click history: " + " -> ".join(click_history))
+    except Exception:
+        pass
+
+
+def iter_page_and_frame_contexts(page):
+    try:
+        frames = list(page.frames)
+    except Exception:
+        frames = []
+    return [page] + [frame for frame in frames if frame is not page]
+
+
+def try_click_text_in_context(target, text, selectors):
+    escaped_text = re.escape(text)
+    exact_pattern = re.compile(r"^\s*" + escaped_text + r"\s*$")
+    fuzzy_pattern = re.compile(escaped_text)
+
+    role_candidates = (
+        ("button", exact_pattern),
+        ("button", fuzzy_pattern),
+        ("link", exact_pattern),
+        ("link", fuzzy_pattern),
+    )
+    for role_name, pattern in role_candidates:
+        try:
+            locator = target.get_by_role(role_name, name=pattern)
+            if locator.count() > 0:
+                locator.first.scroll_into_view_if_needed(timeout=exam_browser_action_timeout_ms)
+                locator.first.click(timeout=exam_browser_action_timeout_ms, force=True)
+                return True
+        except Exception:
+            pass
+
+    for selector in selectors:
+        for pattern in (exact_pattern, fuzzy_pattern):
+            try:
+                locator = target.locator(selector).filter(has_text=pattern)
+                if locator.count() > 0:
+                    locator.first.scroll_into_view_if_needed(timeout=exam_browser_action_timeout_ms)
+                    locator.first.click(timeout=exam_browser_action_timeout_ms, force=True)
+                    return True
+            except Exception:
+                continue
+
+    input_selectors = (
+        "input[type='button']",
+        "input[type='submit']",
+        "input[type='reset']"
+    )
+    for input_selector in input_selectors:
+        for attr_name in ("value", "aria-label", "title"):
+            try:
+                locator = target.locator(input_selector + "[" + attr_name + "*='" + text + "']")
+                if locator.count() > 0:
+                    locator.first.scroll_into_view_if_needed(timeout=exam_browser_action_timeout_ms)
+                    locator.first.click(timeout=exam_browser_action_timeout_ms, force=True)
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def try_click_exam_start_modal_confirm(page):
+    target_selectors = (
+        ".el-dialog__wrapper button",
+        ".el-dialog button",
+        ".ant-modal button",
+        ".modal button",
+        ".dialog button",
+        ".popup button",
+        "button"
+    )
+    exact_pattern = re.compile(r"^\s*开始\s*$")
+    for target in iter_page_and_frame_contexts(page):
+        for selector in target_selectors:
+            try:
+                locator = target.locator(selector).filter(has_text=exact_pattern)
+                if locator.count() > 0:
+                    locator.first.scroll_into_view_if_needed(timeout=exam_browser_action_timeout_ms)
+                    locator.first.click(timeout=exam_browser_action_timeout_ms, force=True)
+                    if exam_browser_debug_enabled:
+                        print("clicked exam start modal confirm: 开始")
+                    return True
+            except Exception:
+                continue
+
+        try:
+            locator = target.get_by_role("button", name=exact_pattern)
+            if locator.count() > 0:
+                locator.first.scroll_into_view_if_needed(timeout=exam_browser_action_timeout_ms)
+                locator.first.click(timeout=exam_browser_action_timeout_ms, force=True)
+                if exam_browser_debug_enabled:
+                    print("clicked exam start modal role button: 开始")
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def try_click_exam_entry_button(page, on_exam_system_page=False):
+    if on_exam_system_page:
+        candidate_texts = (
+            "开始考试",
+            "开始答题",
+            "进入考试",
+            "开始",
+            "继续",
+            "继续考试",
+            "继续答题"
+        )
+    else:
+        candidate_texts = (
+            "继续答题",
+            "开始答题",
+            "进入考试",
+            "继续考试"
+        )
+    selectors = (
+        "button",
+        "a",
+        "[role='button']",
+        ".btn",
+        ".button",
+        ".ant-btn",
+        "span",
+        "div",
+        "p"
+    )
+
+    for target in iter_page_and_frame_contexts(page):
+        for text in candidate_texts:
+            if try_click_text_in_context(target, text, selectors):
+                if exam_browser_debug_enabled:
+                    target_name = "frame" if target is not page else "page"
+                    print("clicked " + target_name + " button text: " + text)
+                return text
+    return None
+
+
+def resolve_exam_context_by_browser(exam_item, course):
+    if sync_playwright is None:
+        raise Exception("未安装 playwright，请先执行 pip install playwright 并运行 playwright install")
+
+    exam_page_url = build_exam_page_url(course["course_sign"], course["classroom_id"], exam_item["id"])
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=exam_browser_headless)
+        context = browser.new_context()
+        try:
+            cookies = build_course_browser_cookies()
+            if cookies:
+                context.add_cookies(cookies)
+            page = context.new_page()
+            page.goto(exam_page_url, wait_until="domcontentloaded", timeout=exam_browser_timeout_ms)
+            try:
+                page.wait_for_load_state("networkidle", timeout=exam_browser_action_timeout_ms)
+            except PlaywrightTimeoutError:
+                pass
+
+            page = select_active_exam_page(context, page)
+            click_history = []
+            exam_context = extract_exam_context_from_browser(context, page)
+
+            # 第一阶段：在课程页只点击一次“开始答题/继续答题”，然后等待新考试页出现
+            if not is_exam_system_page(page):
+                first_click, target_page = click_first_exam_entry_and_wait_for_new_page(context, page)
+                if first_click:
+                    click_history.append(first_click)
+                    if target_page:
+                        page = target_page
+                    exam_context = extract_exam_context_from_browser(context, page)
+
+            # 第二阶段：只在新的考试系统页里继续点击“开始”
+            for _ in range(exam_browser_max_click_rounds):
+                page = select_active_exam_page(context, page)
+                exam_context = extract_exam_context_from_browser(context, page)
+                if is_exam_start_page(page):
+                    second_click = try_click_exam_start_modal_confirm(page)
+                    if second_click:
+                        click_history.append("开始")
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=exam_browser_action_timeout_ms)
+                        except PlaywrightTimeoutError:
+                            pass
+                        page.wait_for_timeout(1200)
+                        continue
+                    page.wait_for_timeout(1000)
+                    continue
+                if exam_context:
+                    show_paper_probe = try_fetch_exam_show_paper_payload(exam_context)
+                    if show_paper_probe.get("ok"):
+                        return exam_context
+                    if show_paper_probe.get("errcode") != 10103:
+                        log_exam_browser_state(context, page, click_history)
+                        raise Exception(
+                            "浏览器已拿到考试上下文，但 show_paper 仍不可用："
+                            + str(show_paper_probe.get("errcode"))
+                            + " "
+                            + str(show_paper_probe.get("errmsg", ""))
+                        )
+
+                if not is_exam_system_page(page):
+                    page = wait_for_exam_page_transition(context, page)
+                    continue
+
+                second_click = try_click_exam_entry_button(page, on_exam_system_page=True)
+                if not second_click:
+                    page.wait_for_timeout(1500)
+                    continue
+
+                click_history.append(second_click)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=exam_browser_action_timeout_ms)
+                except PlaywrightTimeoutError:
+                    pass
+                page.wait_for_timeout(1200)
+
+            exam_context = extract_exam_context_from_browser(context, page)
+            if exam_context:
+                show_paper_probe = try_fetch_exam_show_paper_payload(exam_context)
+                if show_paper_probe.get("ok"):
+                    return exam_context
+                if show_paper_probe.get("errcode") == 10103:
+                    log_exam_browser_state(context, page, click_history)
+                    raise Exception(
+                        "浏览器已进入考试页面，但第二个开始按钮仍未成功触发答卷状态"
+                        + ("，已点击：" + " -> ".join(click_history) if click_history else "")
+                        + ("，当前页面：" + str(page.url) if page else "")
+                    )
+                log_exam_browser_state(context, page, click_history)
+                raise Exception(
+                    "浏览器已拿到考试上下文，但 show_paper 仍不可用："
+                    + str(show_paper_probe.get("errcode"))
+                    + " "
+                    + str(show_paper_probe.get("errmsg", ""))
+                )
+
+            log_exam_browser_state(context, page, click_history)
+            raise Exception(
+                "浏览器自动进入考试后仍未获取到 x_access_token"
+                + ("，已点击：" + " -> ".join(click_history) if click_history else "")
+                + ("，当前页面：" + str(page.url) if page else "")
+            )
+        finally:
+            context.close()
+            browser.close()
+
+
+def resolve_exam_context(exam_item, course):
+    if not exam_browser_auto_context_enabled:
+        raise Exception("当前版本只支持浏览器自动获取考试上下文，请开启 exam_browser_auto_context_enabled")
+    return resolve_exam_context_by_browser(exam_item, course)
 
 
 def build_exam_page_url(course_sign, classroom_id, leaf_id):
     return url_root + "pro/lms/" + str(course_sign) + "/" + str(classroom_id) + "/exam/" + str(leaf_id)
 
 
-def build_exam_system_show_paper_url(exam_id):
-    return exam_system_base_url.rstrip("/") + "/exam_room/show_paper?exam_id=" + str(exam_id)
+def build_exam_system_show_paper_url(exam_base_url, exam_id):
+    return exam_base_url.rstrip("/") + "/exam_room/show_paper?exam_id=" + str(exam_id)
 
 
-def build_exam_system_answer_url():
-    return exam_system_base_url.rstrip("/") + "/exam_room/answer_problem"
+def build_exam_system_answer_url(exam_base_url):
+    return exam_base_url.rstrip("/") + "/exam_room/answer_problem"
 
 
-def build_exam_system_entry_info_url(exam_id):
-    return exam_system_base_url.rstrip("/") + "/exam_room/entry_info?exam_id=" + str(exam_id)
+def build_exam_system_entry_info_url(exam_base_url, exam_id):
+    return exam_base_url.rstrip("/") + "/exam_room/entry_info?exam_id=" + str(exam_id)
 
 
-def build_exam_system_cover_url(exam_id):
-    return exam_system_base_url.rstrip("/") + "/exam_room/cover?exam_id=" + str(exam_id)
+def build_exam_system_cover_url(exam_base_url, exam_id):
+    return exam_base_url.rstrip("/") + "/exam_room/cover?exam_id=" + str(exam_id)
 
 
-def build_exam_system_headers(exam_id):
-    access_token = extract_exam_system_access_token()
+def build_exam_system_headers(exam_base_url, exam_id, access_token):
+    access_token = extract_exam_system_access_token_from_value(access_token)
     if not access_token:
-        raise Exception("exam_system_access_token 为空，请先填入考试系统的 x_access_token")
+        raise Exception("当前考试上下文缺少 x_access_token")
+
+    exam_base_url = str(exam_base_url).strip().rstrip("/")
+    if not exam_base_url:
+        raise Exception("当前考试上下文缺少考试系统域名")
 
     return {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
         "Cookie": "xt_lang=zh; x_access_token=" + access_token,
-        "Origin": exam_system_base_url.rstrip("/"),
-        "Referer": exam_system_base_url.rstrip("/") + "/exam/" + str(exam_id) + "?isFrom=1",
+        "Origin": exam_base_url,
+        "Referer": exam_base_url + "/exam/" + str(exam_id) + "?isFrom=1",
         "User-Agent": headers["User-Agent"],
         "X-Client": "web",
         "Xtbz": "cloud"
     }
 
 
-def fetch_exam_show_paper(exam_id):
+def try_fetch_exam_show_paper_payload(exam_context):
+    exam_id = exam_context["exam_id"]
+    exam_base_url = exam_context["base_url"]
+    access_token = exam_context["access_token"]
+    fetch_url = build_exam_system_show_paper_url(exam_base_url, exam_id)
+    response = requests.get(
+        url=fetch_url,
+        headers=build_exam_system_headers(exam_base_url, exam_id, access_token),
+        timeout=request_timeout
+    )
+    try:
+        payload = json.loads(response.text)
+    except Exception:
+        return {
+            "ok": False,
+            "status_code": response.status_code,
+            "payload": None,
+            "message": "show_paper 返回的不是 JSON"
+        }
+
+    errcode = payload.get("errcode") if isinstance(payload, dict) else None
+    errmsg = payload.get("errmsg", "") if isinstance(payload, dict) else ""
+    return {
+        "ok": errcode in (None, 0),
+        "status_code": response.status_code,
+        "payload": payload,
+        "errcode": errcode,
+        "errmsg": errmsg
+    }
+
+
+def fetch_exam_show_paper(exam_context):
+    exam_id = exam_context["exam_id"]
+    exam_base_url = exam_context["base_url"]
+    access_token = exam_context["access_token"]
     warmup_urls = [
-        build_exam_system_entry_info_url(exam_id),
-        build_exam_system_cover_url(exam_id)
+        build_exam_system_entry_info_url(exam_base_url, exam_id),
+        build_exam_system_cover_url(exam_base_url, exam_id)
     ]
     for warmup_url in warmup_urls:
         warmup_response = requests.get(
             url=warmup_url,
-            headers=build_exam_system_headers(exam_id),
+            headers=build_exam_system_headers(exam_base_url, exam_id, access_token),
             timeout=request_timeout
         )
         if exam_fetch_debug_enabled:
             print("exam system warmup status: " + str(warmup_response.status_code) + " -> " + warmup_url)
 
-    fetch_url = build_exam_system_show_paper_url(exam_id)
+    fetch_url = build_exam_system_show_paper_url(exam_base_url, exam_id)
     response = requests.get(
         url=fetch_url,
-        headers=build_exam_system_headers(exam_id),
+        headers=build_exam_system_headers(exam_base_url, exam_id, access_token),
         timeout=request_timeout
     )
     try:
@@ -683,7 +1275,10 @@ def build_answer_result_values(matched_options):
     return result_values
 
 
-def submit_exam_problem_answer(exam_id, problem, matched_options, answered_problem_ids):
+def submit_exam_problem_answer(exam_context, problem, matched_options, answered_problem_ids):
+    exam_id = exam_context["exam_id"]
+    exam_base_url = exam_context["base_url"]
+    access_token = exam_context["access_token"]
     problem_id = extract_problem_id(problem)
     if problem_id is None:
         raise Exception("当前题目缺少 problem_id，无法自动提交")
@@ -704,14 +1299,14 @@ def submit_exam_problem_answer(exam_id, problem, matched_options, answered_probl
         ]
     }
     response = requests.post(
-        url=build_exam_system_answer_url(),
-        headers=build_exam_system_headers(exam_id),
+        url=build_exam_system_answer_url(exam_base_url),
+        headers=build_exam_system_headers(exam_base_url, exam_id, access_token),
         json=payload,
         timeout=request_timeout
     )
     response_payload = json.loads(response.text)
     if exam_fetch_debug_enabled:
-        print("answer submit status: " + str(response.status_code) + " -> " + build_exam_system_answer_url())
+        print("answer submit status: " + str(response.status_code) + " -> " + build_exam_system_answer_url(exam_base_url))
     if not isinstance(response_payload, dict):
         raise Exception("invalid answer_problem response")
     if response_payload.get("errcode") not in (None, 0):
@@ -788,7 +1383,8 @@ def format_exam_problem(problem, index):
 
 
 def run_exam_ai_helper_for_exam(exam_item, course):
-    exam_id = resolve_exam_id()
+    exam_context = resolve_exam_context(exam_item, course)
+    exam_id = exam_context["exam_id"]
     if exam_id is None:
         raise Exception("cannot resolve exam_id for exam node")
 
@@ -796,9 +1392,10 @@ def run_exam_ai_helper_for_exam(exam_item, course):
     print("考试节点：" + str(exam_item["name"]))
     print("考试页面：" + build_exam_page_url(course["course_sign"], course["classroom_id"], exam_item["id"]))
     print("exam_id: " + str(exam_id))
-    print("show_paper: " + build_exam_system_show_paper_url(exam_id))
+    print("exam_system_base_url: " + str(exam_context["base_url"]))
+    print("show_paper: " + build_exam_system_show_paper_url(exam_context["base_url"], exam_id))
 
-    payload = fetch_exam_show_paper(exam_id)
+    payload = fetch_exam_show_paper(exam_context)
     problems = extract_exam_problem_list(payload)
     if not problems:
         raise Exception("show_paper 已请求成功，但未能解析出题目列表")
@@ -820,7 +1417,7 @@ def run_exam_ai_helper_for_exam(exam_item, course):
                     print(format_option_line(matched_option))
                 if exam_auto_submit_enabled:
                     try:
-                        submit_payload, _ = submit_exam_problem_answer(exam_id, problem, matched_options, answered_problem_ids)
+                        submit_payload, _ = submit_exam_problem_answer(exam_context, problem, matched_options, answered_problem_ids)
                         print("已自动提交答案：" + str(submit_payload["results"][0]["result"]))
                         problem_id = extract_problem_id(problem)
                         if problem_id not in answered_problem_ids:
@@ -1022,8 +1619,10 @@ def run_course(course, user_id):
     if exam_items and exam_ai_helper_enabled:
         try:
             ensure_study_helper_ready()
-            if not extract_exam_system_access_token():
-                raise Exception("exam_system_access_token 为空，请先填入考试系统 token")
+            if not exam_browser_auto_context_enabled:
+                raise Exception("当前版本只支持浏览器自动获取考试上下文，请开启 exam_browser_auto_context_enabled")
+            if sync_playwright is None:
+                raise Exception("未安装 playwright，请先执行 pip install playwright 并运行 playwright install")
             exam_ai_ready = True
         except Exception as e:
             print("考试 AI 辅助未启用：" + str(e))
@@ -1158,7 +1757,9 @@ def fetch_user_courses():
 
 
 def run_course_menu():
-    user_id = fetch_user_id()
+    user_id = ""
+    if video_auto_watch_enabled:
+        user_id = fetch_user_id()
     your_courses = fetch_user_courses()
 
     for index, value in enumerate(your_courses):

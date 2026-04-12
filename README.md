@@ -29,9 +29,7 @@ pip install -r requirements.txt
 playwright install
 ```
 
-### 中国大陆网络环境安装说明
-
-如果你在中国大陆网络环境下安装较慢，推荐这样做：
+如果你的网络环境下安装较慢，推荐这样做：
 
 1. `pip` 走国内镜像
 
@@ -43,19 +41,6 @@ pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 
 ```bash
 playwright install
-```
-
-3. 如果 `playwright install` 还是慢，可以走代理
-
-```powershell
-$Env:HTTPS_PROXY="http://你的代理地址:端口"
-playwright install
-```
-
-如果还是不行，可以在另一台能正常下载的机器上执行 `playwright install`，再把缓存目录拷过来。Windows 常见目录是：
-
-```text
-C:\Users\你的用户名\AppData\Local\ms-playwright
 ```
 
 ## 使用前配置

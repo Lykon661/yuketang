@@ -40,7 +40,8 @@ playwright install
 - `university_id`
 - `url_root`
 
-这些值需要在你已经登录雨课堂后，从浏览器开发者工具中获取。
+这些值需要在你已经登录雨课堂后，从浏览器开发者工具中获取。 [参考](https://blog.csdn.net/lenfranky/article/details/90316262)
+
 
 ### AI 配置
 

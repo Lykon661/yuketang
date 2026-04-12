@@ -1,6 +1,5 @@
 ﻿# -*- coding: utf-8 -*-
 # version 5
-# developed by zk chen
 import random
 import time
 import requests
